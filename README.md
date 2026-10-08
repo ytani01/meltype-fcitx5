@@ -102,10 +102,10 @@ sudo rm -rf /opt/meltype
 
 アンインストールしたあとは fcitx5 を再起動し、設定の入力メソッドから「Meltype」を削除してください。
 
-## Mozc のユーザー辞書を写す
+## Mozc のユーザー辞書を変換する
 
 Meltype のユーザー辞書 (`~/.local/share/Meltype/userdict.txt`) は、fcitx5-mozc のユーザー辞書とは別です。
-fcitx5-mozc に登録してある語は、`tools/mozc-userdict-to-meltype.py` で Meltype へ写せます (Python 3 だけで動きます)。
+fcitx5-mozc に登録してある語は、`tools/mozc-userdict-to-meltype.py` で Meltype のユーザー辞書へ変換できます (Python 3 だけで動きます)。
 このリポジトリのトップディレクトリで実行します。
 
 ```bash
@@ -115,7 +115,7 @@ python3 tools/mozc-userdict-to-meltype.py      # userdict.txt の末尾に足す
 
 - `~/.config/mozc/user_dictionary.db` を読みます。別の場所にあるときは `--src` / `--dest` で指定します
 - `userdict.txt` に**まだ無い語だけ**を足します。既存の行は消さないので、何度実行しても重複しません
-- Meltype が取り込まない語 (読みが 1 文字、読みにひらがな・英数字・「ー」「・」以外がある) と、Mozc の抑制単語は写しません
+- Meltype が取り込まない語 (読みが 1 文字、読みにひらがな・英数字・「ー」「・」以外がある) と、Mozc の抑制単語は変換しません
 - 足した語は、そのあとに開いた入力欄から使えます。開いたままの入力欄では、アプリを開き直してください
 
 ## ライセンス

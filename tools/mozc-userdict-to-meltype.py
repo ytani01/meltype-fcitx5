@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mozc のユーザー辞書を Meltype のユーザー辞書（userdict.txt）へ写す。
+"""Mozc のユーザー辞書を Meltype のユーザー辞書（userdict.txt）へ変換する。
 
 Mozc の ~/.config/mozc/user_dictionary.db（protobuf の UserDictionaryStorage）を読み、
 Meltype の ~/.local/share/Meltype/userdict.txt にまだ無い「読み[Tab]単語」だけを末尾に足す。
