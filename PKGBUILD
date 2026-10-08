@@ -3,7 +3,7 @@
 # 本体 (libMeltypeNative.so) と変換ヘルパーは配布 zip のものを /usr/lib/meltype-fcitx5 にインストールし、アドオンもそこを見るようにビルドする。
 # IBus 版の install.sh が使う /opt/meltype とは分ける。
 pkgname=meltype-fcitx5
-pkgver=1.0.4
+pkgver=1.1.0
 pkgrel=2
 pkgdesc='Meltype input method for fcitx5'
 arch=('x86_64')
@@ -17,15 +17,13 @@ makedepends=('cmake')
 options=('!strip' '!debug')
 source=("https://github.com/yksr-melt/Meltype/releases/download/v$pkgver/Meltype-$pkgver-linux.zip"
         'CMakeLists.txt' 'meltype.cpp' 'meltype-addon.conf' 'meltype.conf')
-sha256sums=('62b438477d8b982a3a09fe6f5b236df569ff7abd6781c5d13b02395f4789cf4f'
+sha256sums=('140a193cae595760d708add48d4ccd2a13fd5f36ce1fb4684493c3b02de418f1'
             'SKIP' 'SKIP' 'SKIP' 'SKIP')
 
 # makepkg は source のファイルを src/ にシンボリックリンクで置き、cmake --install はリンクのままインストールするので、実体にする
+# (meltype.conf は configure_file がビルドのディレクトリに実体を書く)
 prepare() {
-  local f
-  for f in meltype-addon.conf meltype.conf; do
-    cp --remove-destination "$(readlink -f "$f")" "$f"
-  done
+  cp --remove-destination "$(readlink -f meltype-addon.conf)" meltype-addon.conf
 }
 
 build() {
@@ -37,9 +35,11 @@ build() {
 package() {
   DESTDIR="$pkgdir" cmake --install build
 
+  # zip の fcitx5/ (配布元のアドオン) は入れない。このアドオンと同じ所に同じ名前で入るため
   cd Meltype-linux
   install -Dm755 libMeltypeNative.so "$pkgdir/usr/lib/meltype-fcitx5/libMeltypeNative.so"
   install -Dm755 mozc/meltype_mozc_helper "$pkgdir/usr/lib/meltype-fcitx5/mozc/meltype_mozc_helper"
   install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE THIRD-PARTY-NOTICES.md \
     mozc/MOZC-LICENSE.txt mozc/MOZC-CREDITS.html
+  install -Dm644 icon.png "$pkgdir/usr/lib/meltype-fcitx5/icon.png"
 }

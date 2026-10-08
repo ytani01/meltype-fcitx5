@@ -20,12 +20,16 @@ Meltype の Linux 版は IBus のエンジンなので、fcitx5 では使えま�
   不具合はこのリポジトリの Issue に報告してください
 - **本体とヘルパーは、配布元のリリースの zip (`Meltype-<版>-linux.zip`) のものを使います。**
   このリポジトリには入っていません。.NET や Mozc のビルドは要りません
+- **このアドオンを入れた PC では、配布元の zip の `install.sh`・`uninstall.sh` を実行しないでください。**
+  Meltype 1.1.0 から、`install.sh` は fcitx5 があると配布元の fcitx5 のアドオンを入れます。
+  このアドオンと同じ場所に同じ名前で入るので、このアドオンが上書きされます (`uninstall.sh` は消します)。
+  IBus 版だけを使うつもりでも同じです
 
 ## 動作を確認した環境
 
 - CachyOS (Arch Linux 系)
 - fcitx5 5.1.23
-- Meltype 1.0.4
+- Meltype 1.1.0
 
 Ubuntu などではまだ確認していません。
 
@@ -44,7 +48,7 @@ makepkg -si
 | --- | --- |
 | `/usr/lib/fcitx5/meltype.so` | アドオン |
 | `/usr/share/fcitx5/addon/meltype.conf`、`/usr/share/fcitx5/inputmethod/meltype.conf` | アドオンと入力メソッドの定義 |
-| `/usr/lib/meltype-fcitx5/libMeltypeNative.so`、`/usr/lib/meltype-fcitx5/mozc/meltype_mozc_helper` | 本体と変換ヘルパー (zip の中身をそのまま) |
+| `/usr/lib/meltype-fcitx5/libMeltypeNative.so`、`/usr/lib/meltype-fcitx5/mozc/meltype_mozc_helper`、`/usr/lib/meltype-fcitx5/icon.png` | 本体と変換ヘルパー、パネル (トレイ) のアイコン (zip の中身をそのまま) |
 | `/usr/share/licenses/meltype-fcitx5/` | 本体のライセンス |
 
 アンインストールするときは `sudo pacman -R meltype-fcitx5` を実行します。
@@ -78,10 +82,13 @@ sudo cmake --install build
 
 ```bash
 sudo mkdir -p /opt/meltype
-sudo cp -R libMeltypeNative.so mozc LICENSE THIRD-PARTY-NOTICES.md /opt/meltype/
+sudo cp -R libMeltypeNative.so mozc icon.png LICENSE THIRD-PARTY-NOTICES.md /opt/meltype/
 ```
 
-アドオンは本体を `/opt/meltype` から読み込みます。別の場所に置くときは、fcitx5 を起動する環境で、環境変数 `MELTYPE_DIR` にそのディレクトリを指定します。
+`icon.png` はパネル (トレイ) に出すアイコンです。
+
+アドオンは本体を `/opt/meltype` から読み込みます。別の場所に置くときは、ビルドするときに `-DMELTYPE_DEFAULT_DIR=<その場所>` を付けます。
+環境変数 `MELTYPE_DIR` でも本体の場所を変えられますが、アイコンはビルドしたときの場所を指したままです。
 
 ### アンインストール
 

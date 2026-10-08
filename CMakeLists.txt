@@ -19,4 +19,7 @@ target_compile_definitions(meltype PRIVATE MELTYPE_DEFAULT_DIR="${MELTYPE_DEFAUL
 # fcitx5 と同じ所にインストールするには -DCMAKE_INSTALL_PREFIX=/usr を付ける。
 install(TARGETS meltype DESTINATION "${FCITX_INSTALL_ADDONDIR}")
 install(FILES meltype-addon.conf DESTINATION "${FCITX_INSTALL_PKGDATADIR}/addon" RENAME meltype.conf)
-install(FILES meltype.conf DESTINATION "${FCITX_INSTALL_PKGDATADIR}/inputmethod")
+# トレイのアイコン (Icon=) は、本体と同じ所に置いた icon.png を絶対パスで指す
+# 出力の名前を変えるのは、ソースの中でビルドしても (cmake .) 元の meltype.conf を上書きしないため
+configure_file(meltype.conf meltype-im.conf @ONLY)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/meltype-im.conf" DESTINATION "${FCITX_INSTALL_PKGDATADIR}/inputmethod" RENAME meltype.conf)

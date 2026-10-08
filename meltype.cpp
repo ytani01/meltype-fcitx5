@@ -63,7 +63,9 @@ struct Native {
     char *(*commit)(void *) = nullptr;
     char *(*selectCandidate)(void *, int) = nullptr;
     void (*setDirect)(void *, int) = nullptr;
+    void (*setCanDelete)(void *, int) = nullptr; // 1.1.0 から。古い本体には無い
     void (*free)(char *) = nullptr;
+    std::filesystem::path dataDirectory; // 学習の記録の置き場所 (meltype_data_directory)。分からなければ空
 
     // 本体を読む。読めなければ create を nullptr にする (キーはすべてアプリに渡す)。
     // .NET のランタイムは閉じられないので dlclose はしない。
@@ -94,6 +96,13 @@ struct Native {
         if (!ok) {
             create = nullptr;
             return;
+        }
+        setCanDelete = reinterpret_cast<decltype(setCanDelete)>(dlsym(handle, "meltype_set_can_delete"));
+        if (auto directory = reinterpret_cast<char *(*)()>(dlsym(handle, "meltype_data_directory"))) {
+            if (char *path = directory()) {
+                dataDirectory = path;
+                free(path);
+            }
         }
         if (!initMozc((base + "/mozc/meltype_mozc_helper").c_str(), nullptr)) {
             FCITX_ERROR() << "Meltype: Mozc を使えません (漢字変換はひらがなのままになります)";
@@ -271,6 +280,20 @@ std::filesystem::path keyMapPath() {
     return base / "meltype-fcitx5" / "keymap.conf";
 }
 
+// 本体がセッションごとに読んで持つ学習の記録のうち、いちばん新しい更新日時 (無ければ最小の値)。
+// 本体は作ったときに 1 回だけ読み、保存では自分の持っている分だけで書き直すので、別の入力欄が覚えた分を消してしまう。
+std::filesystem::file_time_type learnedTime(const std::filesystem::path &base) {
+    auto latest = std::filesystem::file_time_type::min();
+    for (const char *name : {"conversions.json", "languages.json", "translations.json"}) {
+        std::error_code error;
+        const auto time = std::filesystem::last_write_time(base / name, error);
+        if (!error) {
+            latest = std::max(latest, time);
+        }
+    }
+    return latest;
+}
+
 // Shift と小文字の英字の組 (Shift+a) を、実際に打ったときと同じ大文字 (Shift+A) にする。
 // そのまま正規化すると Shift だけが消えて a になり、Shift 無しの a に一致してしまう。
 Key shiftedLetter(const Key &key) {
@@ -375,14 +398,46 @@ public:
                 createFailed_ = true;
                 FCITX_ERROR() << "Meltype: 入力欄のセッションを作れません (この入力欄ではキーをアプリに渡します)";
             }
+            noteLearned();
         }
         return session_;
+    }
+
+    // 別の入力欄が学習を保存していたら、セッションを作り直して読み直させる。
+    // フォーカスを得たときと、未確定の文字が無いときのキーで確かめる (fcitx5 のフォーカスは wayland と X11 で別々に持つので、
+    // フォーカスを得たときだけでは足りない)。自分で保存した分は noteLearned で読んだことにする。
+    // ponytail: 未確定の文字があるあいだに別の入力欄が保存すると、それは消える。英数で判定中の英字 (変換中の表示が無い) の
+    // あいだに作り直すと、その英字を変換し直せない。どちらも wayland と X11 の入力欄で交互に打たないと起きない。
+    void reloadIfLearnedElsewhere() {
+        if (!session_ || preeditVisible_ || native_.dataDirectory.empty() ||
+            learnedTime(native_.dataDirectory) == seenTime_) {
+            return;
+        }
+        // 先に作る。作れなければ古いセッションのまま使い続ける (学習が消えることはあるが、入力はできる)。
+        void *fresh = native_.create();
+        if (!fresh) {
+            FCITX_ERROR() << "Meltype: 入力欄のセッションを作り直せません (前のセッションのまま使います)";
+            return;
+        }
+        native_.destroy(session_);
+        session_ = fresh;
+        native_.setDirect(session_, direct_ ? 1 : 0);
+        noteLearned();
+    }
+
+    // 本体を呼んだ後 (保存したかもしれない): この時点の学習を読んだものとする。
+    void noteLearned() {
+        if (!native_.dataDirectory.empty()) {
+            seenTime_ = learnedTime(native_.dataDirectory);
+        }
     }
 
     void keyEvent(KeyEvent &event) {
         if (event.isRelease() || !ensureSession()) {
             return;
         }
+        reloadIfLearnedElsewhere();
+        syncCanDelete();
         const Key key = mappedKey(event);
         if (!key.isValid()) {
             return; // 置き換え先が空: 本体に渡さず、押したキーのままアプリへ
@@ -454,19 +509,26 @@ public:
             return;
         }
         native_.free(native_.commit(session_));
+        // 未確定の文字が無ければ本体は何も保存しない。ここで覚えると、別の入力欄の保存を読まずに読んだことになる。
+        const bool saved = preeditVisible_;
         if (preeditVisible_ && !(focusOut && clientPreedit_)) {
             ic_.commitString(preeditText_);
         }
         hidePreedit();
         hideCandidates();
         ic_.updateUserInterface(UserInterfaceComponent::InputPanel);
+        if (saved) {
+            noteLearned();
+        }
     }
 
     void selectCandidate(int index) {
         if (session_) {
+            syncCanDelete();
             json_object *result = native_.result(native_.selectCandidate(session_, index));
             apply(result);
             json_object_put(result);
+            noteLearned();
         }
     }
 
@@ -617,6 +679,17 @@ private:
         ic_.inputPanel().setCandidateList(nullptr);
     }
 
+    // 確定し直し (deleteBefore) は、入力欄が周りの文字に対応していて読めるときだけ本体にさせる。
+    // 消せない入力欄で確定し直すと、元の文字が残ったまま書き足される (api → apiあぴ)。
+    // 結果を入力欄に出す本体の呼び出しの前に毎回伝える (入力欄を移った最初のキーで、前の入力欄の値のまま確定し直さないように)。
+    void syncCanDelete() const {
+        if (native_.setCanDelete) {
+            const bool canDelete =
+                ic_.capabilityFlags().test(CapabilityFlag::SurroundingText) && ic_.surroundingText().isValid();
+            native_.setCanDelete(session_, canDelete ? 1 : 0);
+        }
+    }
+
     // 入力欄のキャレットの前後の文字列 (それぞれ 20 文字まで)。入力欄が対応していなければ入れない。
     void surroundingText(std::optional<std::string> &before, std::optional<std::string> &after) const {
         if (!ic_.capabilityFlags().test(CapabilityFlag::SurroundingText)) {
@@ -651,6 +724,7 @@ private:
     bool preeditVisible_ = false;
     bool clientPreedit_ = false;
     bool createFailed_ = false;
+    std::filesystem::file_time_type seenTime_;
     std::string preeditText_;
     std::optional<std::string> meaningKey_;
     std::unique_ptr<EventSourceTime> meaningTimer_;
@@ -671,11 +745,16 @@ public:
     }
 
     void keyEvent(const InputMethodEntry &, KeyEvent &event) override {
-        state(event.inputContext())->keyEvent(event);
+        MeltypeState *current = state(event.inputContext());
+        current->keyEvent(event);
+        current->noteLearned();
     }
 
     void activate(const InputMethodEntry &, InputContextEvent &event) override {
-        state(event.inputContext())->ensureSession();
+        MeltypeState *current = state(event.inputContext());
+        if (current->ensureSession()) {
+            current->reloadIfLearnedElsewhere();
+        }
     }
 
     // 別の入力欄・アプリに移るとき、入力メソッドを切り替えたときは、表示していた未確定の文字を確定する。
