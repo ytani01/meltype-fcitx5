@@ -9,12 +9,18 @@
 // 本体の場所は環境変数 MELTYPE_DIR で渡す。配布 zip を展開したディレクトリ
 // (libMeltypeNative.so と mozc/meltype_mozc_helper がある所) を指す。無ければビルド時の MELTYPE_DEFAULT_DIR
 // (既定は /opt/meltype、install.sh が本体をインストールする所。パッケージは /usr/lib/meltype-fcitx5)。
+//
+// 変換中のキーの割り当ては ~/.config/meltype-fcitx5/keymap.conf (1 行 1 組で「キー = 置き換え先のキー」) に置く。
+// 置き換え先を空にした行 (Down =) のキーは、本体に渡さずアプリに渡す。
+// アドオン設定 (fcitx5-configtool) も同じファイルを読み書きする。ファイルが無ければ何も置き換えない。
 #include <dlfcn.h>
 #include <json-c/json.h>
 
 #include <algorithm>
 #include <cstdlib>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -25,7 +31,10 @@
 #include <fcitx-utils/eventloopinterface.h>
 #include <fcitx-utils/key.h>
 #include <fcitx-utils/log.h>
+#include <fcitx-utils/stringutils.h>
 #include <fcitx-utils/utf8.h>
+#include <fcitx-config/configuration.h>
+#include <fcitx-config/option.h>
 #include <fcitx/addonfactory.h>
 #include <fcitx/addoninstance.h>
 #include <fcitx/addonmanager.h>
@@ -205,6 +214,131 @@ bool isModeKey(KeySym sym) {
     }
 }
 
+// ---- 変換中のキーの割り当て ----
+
+// 割り当ての 1 組。左が押すキー、右が置き換え先のキー。置き換え先が空 (Key()) なら、本体に渡さずアプリに渡す。
+using KeyMap = std::vector<std::pair<Key, Key>>;
+
+// 置き換え先のキーのうち、変換中に本体が意味を持たせているもの (~/work/Meltype の CompositionController.cs)。
+// アドオン設定の画面には、これを 1 つずつ「意味（キー）」の欄にして、押すキーの一覧を並べる。
+// 最後の欄 (置き換え先が空) は、本体に渡さずアプリに渡すキー。
+struct Action {
+    const char *name;    // 設定の項目名
+    const char *key;     // 置き換え先のキー
+    const char *meaning; // 変換中に本体がすること
+};
+constexpr Action ACTIONS[] = {
+    {"Space", "space", "変換・次の候補"},
+    {"ShiftSpace", "Shift+space", "ローマ字として変換・次の候補"},
+    {"Down", "Down", "次の候補"},
+    {"Up", "Up", "前の候補"},
+    {"Right", "Right", "次の文節"},
+    {"Left", "Left", "前の文節"},
+    {"ShiftRight", "Shift+Right", "文節を伸ばす"},
+    {"ShiftLeft", "Shift+Left", "文節を縮める"},
+    {"Return", "Return", "確定"},
+    {"BackSpace", "BackSpace", "1 文字消す・変換の取り消し"},
+    {"Escape", "Escape", "取り消し"},
+    {"Tab", "Tab", "もしかして（書き間違いを直す）"},
+    {"F6", "F6", "ひらがな"},
+    {"F7", "F7", "カタカナ"},
+    {"F9", "F9", "全角英数"},
+    {"F10", "F10", "半角英数"},
+    {"PassThrough", "", "本体に渡さずアプリに渡す"},
+};
+
+// アドオン設定。置き換え先ごとに、押すキーの一覧を持つ。中身は keymap.conf から作り、保存すると keymap.conf に書く。
+class MeltypeConfig : public Configuration {
+public:
+    MeltypeConfig() {
+        for (const Action &action : ACTIONS) {
+            keys.push_back(std::make_unique<KeyListOption>(
+                this, action.name, *action.key ? std::string(action.meaning) + "（" + action.key + "）" : action.meaning,
+                KeyList(),
+                KeyListConstrain(KeyConstrainFlag::AllowModifierLess)));
+        }
+    }
+    const char *typeName() const override { return "MeltypeConfig"; }
+
+    std::vector<std::unique_ptr<KeyListOption>> keys; // ACTIONS と同じ順
+};
+
+std::filesystem::path keyMapPath() {
+    const char *config = std::getenv("XDG_CONFIG_HOME");
+    const char *home = std::getenv("HOME");
+    const std::filesystem::path base =
+        config && *config ? std::filesystem::path(config) : std::filesystem::path(home ? home : "") / ".config";
+    return base / "meltype-fcitx5" / "keymap.conf";
+}
+
+// Shift と小文字の英字の組 (Shift+a) を、実際に打ったときと同じ大文字 (Shift+A) にする。
+// そのまま正規化すると Shift だけが消えて a になり、Shift 無しの a に一致してしまう。
+Key shiftedLetter(const Key &key) {
+    const KeySym sym = key.sym();
+    if (key.states().test(KeyState::Shift) && sym >= FcitxKey_a && sym <= FcitxKey_z) {
+        return Key(static_cast<KeySym>(sym - FcitxKey_a + FcitxKey_A), key.states());
+    }
+    return key;
+}
+
+// 置き換え先が ACTIONS の key と同じキーか (Control+Down と Ctrl+Down のような書き方の違いは正規化して比べる)
+bool sameKey(const Key &a, const Key &b) { return a.normalize() == b.normalize(); }
+
+// 読めない行は飛ばしてログに出す。# で始まる行と空行は無視する。ファイルが無ければ空。
+// 置き換え先が空の行 (Down =) は、置き換え先を Key() にする。
+KeyMap readKeyMap(const std::filesystem::path &path) {
+    KeyMap entries;
+    std::ifstream file(path);
+    if (!file && std::filesystem::exists(path)) {
+        FCITX_WARN() << "Meltype: " << path.string() << " を開けません";
+    }
+    std::string line;
+    for (int number = 1; std::getline(file, line); number++) {
+        const std::string_view text = stringutils::trimView(line);
+        if (text.empty() || text.front() == '#') {
+            continue;
+        }
+        const size_t equal = text.find('=');
+        if (equal != std::string_view::npos) {
+            const Key from{std::string(stringutils::trimView(text.substr(0, equal)))};
+            const std::string_view right = stringutils::trimView(text.substr(equal + 1));
+            const Key to = right.empty() ? Key() : Key(std::string(right));
+            if (from.isValid() && !from.isModifier() && (right.empty() || (to.isValid() && !to.isModifier()))) {
+                entries.emplace_back(from, to);
+                continue;
+            }
+        }
+        FCITX_WARN() << "Meltype: " << path.string() << ":" << number << " を読めません: " << line;
+    }
+    return entries;
+}
+
+// 割り当ての行だけで書き直す (コメントと空行は残らない)。途中で失敗しても元のファイルを壊さないよう、別名で書いてから置き換える。
+// シンボリックリンクならリンク先を書き直す (dotfiles で管理していてもリンクが外れない)。
+void writeKeyMap(const std::filesystem::path &link, const KeyMap &entries) {
+    std::error_code error;
+    std::filesystem::path path = std::filesystem::weakly_canonical(link, error);
+    if (error) {
+        path = link;
+    }
+    std::filesystem::create_directories(path.parent_path(), error);
+    const std::filesystem::path temporary = path.string() + ".tmp";
+    std::ofstream file(temporary);
+    for (const auto &[from, to] : entries) {
+        file << from.toString() << " =" << (to.isValid() ? " " + to.toString() : "") << "\n";
+    }
+    file.close();
+    if (!file) {
+        FCITX_ERROR() << "Meltype: " << temporary.string() << " に書けません";
+        std::filesystem::remove(temporary, error);
+        return;
+    }
+    std::filesystem::rename(temporary, path, error);
+    if (error) {
+        FCITX_ERROR() << "Meltype: " << path.string() << " に書けません: " << error.message();
+    }
+}
+
 // ---- 入力欄ごとの状態 ----
 
 class MeltypeState;
@@ -223,8 +357,8 @@ private:
 
 class MeltypeState : public InputContextProperty {
 public:
-    MeltypeState(const Native &native, Instance *instance, InputContext &ic)
-        : native_(native), instance_(instance), ic_(ic),
+    MeltypeState(const Native &native, const KeyMap &keyMap, Instance *instance, InputContext &ic)
+        : native_(native), keyMap_(keyMap), instance_(instance), ic_(ic),
           session_(nullptr) {}
     ~MeltypeState() override {
         if (session_) {
@@ -249,7 +383,10 @@ public:
         if (event.isRelease() || !ensureSession()) {
             return;
         }
-        const Key key = event.rawKey();
+        const Key key = mappedKey(event);
+        if (!key.isValid()) {
+            return; // 置き換え先が空: 本体に渡さず、押したキーのままアプリへ
+        }
         const KeySym sym = key.sym();
         // 半角/全角: 英数 (直接入力) ⇔ 日本語。英数・ひらがなのキーでも切り替える (JIS キーボード)。
         if (isModeKey(sym)) {
@@ -294,6 +431,19 @@ public:
             event.filterAndAccept();
         }
         json_object_put(result);
+    }
+
+    // 変換中だけ、割り当てに従ってキーを置き換える。変換中でないときはアプリのキー操作を邪魔しない。
+    // 押したキー (event.key()) は fcitx5 が正規化していて Control+n は Control+N になるので、割り当ても正規化して比べる。
+    Key mappedKey(const KeyEvent &event) const {
+        if (preeditVisible_) {
+            for (const auto &[from, to] : keyMap_) {
+                if (event.key().check(shiftedLetter(from).normalize())) {
+                    return shiftedLetter(to);
+                }
+            }
+        }
+        return event.rawKey();
     }
 
     // 未確定の内容を、表示していた文字のまま確定する (フォーカスが外れた・入力メソッドの切り替え・reset)。
@@ -363,6 +513,7 @@ private:
         const std::string text = stringOf(view, "text");
         const std::vector<std::string> clauses = stringsOf(view, "clauses");
         Text preedit;
+        size_t cursor = text.size();
         if (boolOf(view, "converting") && !clauses.empty()) {
             // 変換中: 文節ごとに下線。選んでいる文節は強調する (色はテーマに任せる)。
             const int selected = intOf(view, "selectedClause", -1);
@@ -372,6 +523,9 @@ private:
                 TextFormatFlags format = TextFormatFlag::Underline;
                 if (static_cast<int>(index) == selected) {
                     format |= TextFormatFlag::HighLight;
+                    // カーソルは選んでいる文節の先頭に置く (Mozc と同じ)。末尾に置くと候補の長さで候補ウィンドウが動き、
+                    // マウスのポインターの下で動くと、強調が上下キーで選んだ候補でなくポインターの下の候補になる
+                    cursor = position;
                 }
                 preedit.append(text.substr(position, length), format);
                 position += length;
@@ -382,7 +536,7 @@ private:
         } else if (!text.empty()) {
             preedit.append(text, TextFormatFlag::Underline);
         }
-        preedit.setCursor(static_cast<int>(text.size()));
+        preedit.setCursor(static_cast<int>(cursor));
         clientPreedit_ = ic_.capabilityFlags().test(CapabilityFlag::Preedit);
         if (clientPreedit_) {
             ic_.inputPanel().setClientPreedit(preedit);
@@ -489,6 +643,7 @@ private:
     }
 
     const Native &native_;
+    const KeyMap &keyMap_;
     Instance *instance_;
     InputContext &ic_;
     void *session_;
@@ -509,8 +664,9 @@ class MeltypeEngine : public InputMethodEngine {
 public:
     explicit MeltypeEngine(Instance *instance)
         : instance_(instance),
-          factory_([this](InputContext &ic) { return new MeltypeState(native_, instance_, ic); }) {
+          factory_([this](InputContext &ic) { return new MeltypeState(native_, keyMap_, instance_, ic); }) {
         native_.load();
+        reloadConfig();
         instance_->inputContextManager().registerProperty("meltypeState", &factory_);
     }
 
@@ -532,11 +688,67 @@ public:
         state(event.inputContext())->commitShown(false);
     }
 
+    // アドオン設定は keymap.conf と同期する (保存先はこのファイルだけ)。手で直したら fcitx5 の再起動で読み直す
+    // (fcitx5-remote -r は全体の設定だけを読み直し、ここは呼ばない)。
+    void reloadConfig() override {
+        keyMap_ = readKeyMap(keyMapPath());
+        fillConfig();
+    }
+    const Configuration *getConfig() const override { return &config_; }
+    // 画面の欄 (ACTIONS の置き換え先) の分だけを入れ替える。ほかの置き換え先の組は keymap.conf のまま残す。
+    // 同じ押すキーが複数の行にあると先の行が効くので、残す行の順は変えない (消した行は抜き、増えた行は末尾に足す)。
+    void setConfig(const RawConfig &raw) override {
+        config_.load(raw);
+        std::vector<KeyList> added(std::size(ACTIONS));
+        for (size_t i = 0; i < std::size(ACTIONS); i++) {
+            std::ranges::copy_if(config_.keys[i]->value(), std::back_inserter(added[i]),
+                                 [](const Key &key) { return key.isValid(); });
+        }
+        std::erase_if(keyMap_, [&](const auto &entry) {
+            for (size_t i = 0; i < std::size(ACTIONS); i++) {
+                if (sameKey(entry.second, Key(ACTIONS[i].key))) {
+                    // 画面に残っている押すキーなら、行はそのまま残し、足す側からは外す
+                    auto kept = std::ranges::find_if(added[i], [&](const Key &key) {
+                        return shiftedLetter(key).normalize() == shiftedLetter(entry.first).normalize();
+                    });
+                    if (kept == added[i].end()) {
+                        return true;
+                    }
+                    added[i].erase(kept);
+                    return false;
+                }
+            }
+            return false;
+        });
+        for (size_t i = 0; i < std::size(ACTIONS); i++) {
+            for (const Key &from : added[i]) {
+                keyMap_.emplace_back(from, Key(ACTIONS[i].key));
+            }
+        }
+        fillConfig();
+        writeKeyMap(keyMapPath(), keyMap_);
+    }
+
 private:
     MeltypeState *state(InputContext *ic) { return ic->propertyFor(&factory_); }
 
+    // 画面の欄に、keymap.conf の組を置き換え先ごとに分けて入れる
+    void fillConfig() {
+        for (size_t i = 0; i < std::size(ACTIONS); i++) {
+            KeyList keys;
+            for (const auto &[from, to] : keyMap_) {
+                if (sameKey(to, Key(ACTIONS[i].key))) {
+                    keys.push_back(from);
+                }
+            }
+            config_.keys[i]->setValue(keys);
+        }
+    }
+
     Instance *instance_;
     Native native_;
+    KeyMap keyMap_;
+    MeltypeConfig config_;
     FactoryFor<MeltypeState> factory_;
 };
 
