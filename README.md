@@ -1,5 +1,11 @@
 # meltype-fcitx5
 
+> [!WARNING]
+> **このアドオンの開発はやめました。このリポジトリはアーカイブしてあります。**
+> Meltype 1.1.0 から、配布元が fcitx5 のアドオン (`linux/fcitx5/`) を同梱しています。
+> fcitx5 で使うときは、[配布元のリリース](https://github.com/yksr-melt/Meltype/releases) の手順で入れてください。
+> このアドオンを入れている場合は、先に `sudo pacman -R meltype-fcitx5` で外してください (同じ場所に同じ名前で入るため)。
+
 > [!IMPORTANT]
 > **このリポジトリのコードと文書は、[Claude Code](https://claude.com/claude-code) で作りました。**
 > 人間の目でも確認していますが、正直、細部まですべては把握しきれていません。
@@ -16,8 +22,7 @@ Meltype の Linux 版は IBus のエンジンなので、fcitx5 では使えま�
                   libMeltypeNative.so (本体) → mozc/meltype_mozc_helper (漢字変換)
 ```
 
-- **Meltype の配布元とは別に作っているものです。** 配布元はこのアドオンに関わっていません。
-  不具合はこのリポジトリの Issue に報告してください
+- **Meltype の配布元とは別に作ったものです。** 配布元はこのアドオンに関わっていません
 - **本体とヘルパーは、配布元のリリースの zip (`Meltype-<版>-linux.zip`) のものを使います。**
   このリポジトリには入っていません。.NET や Mozc のビルドは要りません
 - **このアドオンを入れた PC では、配布元の zip の `install.sh`・`uninstall.sh` を実行しないでください。**
